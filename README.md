@@ -34,6 +34,7 @@ app_port: 7860
 - 密码保护（默认 `linux123`，可通过 `WEB_PASSWORD` 环境变量修改）
 - 登录二维码实时显示 + 手动刷新
 - 数据持久化到 HF Storage Bucket
+- 阅读完成或失败后可推送到 Bark / Telegram
 
 ## 部署到 HuggingFace Spaces
 
@@ -42,7 +43,11 @@ app_port: 7860
 3. 在 Space Settings → Variables and secrets 中设置：
    - `WEB_PASSWORD`（可选，默认 `114114aa`）
    - `SECRET_KEY`（可选，Flask session 加密）
+   - `BARK_ENDPOINT`（可选，完整 Bark 地址，例如 `https://api.day.app/你的key`）
+   - `TELEGRAM_BOT_TOKEN`（可选，Telegram bot token）
+   - `TELEGRAM_CHAT_ID`（可选，Telegram private chat id）
 4. 创建 Storage Bucket 并挂载到 `/data`（读写模式）
+5. 防休眠：用 UptimeRobot 或 cron-job.org 每 5 分钟访问 `https://你的-space.hf.space/healthz`
 
 ## 环境变量
 
@@ -54,6 +59,12 @@ app_port: 7860
 | `READING_INTERVAL_HOURS` | 12 | 自动阅读间隔（小时） |
 | `SELF_PING_MINUTES` | 5 | 自 ping 间隔（分钟） |
 | `WEB_PASSWORD` | 114114aa | Web 面板登录密码 |
+| `BARK_ENDPOINT` | 空 | 完整 Bark 推送地址，优先于 `BARK_KEY` |
+| `BARK_KEY` | 空 | Bark device key，可配合 `BARK_URL` 使用 |
+| `BARK_URL` | https://api.day.app | Bark 服务地址 |
+| `TELEGRAM_BOT_TOKEN` | 空 | Telegram bot token，用于主动推送 |
+| `TELEGRAM_CHAT_ID` | 空 | Telegram chat id；主动推送不需要 webhook |
+| `SPACE_URL` | 当前 Space 地址 | 推送消息里附带的管理面板链接 |
 
 ## Web 端点
 

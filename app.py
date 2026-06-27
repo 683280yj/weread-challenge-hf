@@ -61,6 +61,7 @@ PUBLIC_ENV_KEYS = (
 )
 SECRET_ENV_KEYS = (
     "BARK_KEY", "EMAIL_PASS", "EMAIL_USER", "EMAIL_TO", "EMAIL_FROM", "EMAIL_SMTP",
+    "BARK_ENDPOINT", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID",
 )
 
 app = Flask(__name__)
@@ -216,22 +217,32 @@ def _public_env() -> dict:
 
 def _notification_status() -> dict:
     """Check which notification channels are configured."""
+    cfg = _load_notif_config()
     channels = []
-    if os.environ.get("BARK_KEY"):
+    if cfg["bark"].get("bark_key") or cfg["bark"].get("bark_endpoint"):
         channels.append({"name": "Bark", "configured": True})
     else:
         channels.append({"name": "Bark", "configured": False})
 
-    if os.environ.get("PUSHPLUS_TOKEN"):
+    telegram_set = all(cfg["telegram"].get(f) for f in ["telegram_bot_token", "telegram_chat_id"])
+    channels.append({
+        "name": "Telegram",
+        "configured": telegram_set,
+        "missing_fields": [
+            f for f in ["telegram_bot_token", "telegram_chat_id"] if not cfg["telegram"].get(f)
+        ],
+    })
+
+    if cfg["pushplus"].get("pushplus_token"):
         channels.append({"name": "PushPlus", "configured": True})
     else:
         channels.append({"name": "PushPlus", "configured": False})
 
-    email_fields = ["EMAIL_USER", "EMAIL_PASS", "EMAIL_TO", "EMAIL_SMTP"]
-    email_set = all(os.environ.get(f) for f in email_fields)
-    channels.append({"name": "Email", "configured": email_set, "missing_fields": [f for f in email_fields if not os.environ.get(f)]})
+    email_fields = ["email_user", "email_pass", "email_to", "email_smtp"]
+    email_set = all(cfg["email"].get(f) for f in email_fields)
+    channels.append({"name": "Email", "configured": email_set, "missing_fields": [f for f in email_fields if not cfg["email"].get(f)]})
 
-    if os.environ.get("WEBHOOK_URL"):
+    if cfg["webhook"].get("webhook_url"):
         channels.append({"name": "Webhook", "configured": True})
     else:
         channels.append({"name": "Webhook", "configured": False})
@@ -241,11 +252,18 @@ def _notification_status() -> dict:
 
 # ─── Background workers ───────────────────────────────────────────────────────
 def _spawn_reader(trigger: str) -> int:
+    env = os.environ.copy()
+    for fields in _load_notif_config().values():
+        for field, value in fields.items():
+            env_key = _NOTIF_ENV_MAP.get(field)
+            if env_key and value:
+                env[env_key] = value
     proc = subprocess.Popen(
         [str(START_SCRIPT), trigger],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        env=env,
     )
     return proc.pid
 
@@ -427,7 +445,8 @@ def route_logs_clean() -> Response:
 
 # ─── Notification config ──────────────────────────────────────────────────────
 NOTIF_SCHEMA = {
-    "bark": {"bark_key": "", "bark_url": "https://api.day.app"},
+    "bark": {"bark_key": "", "bark_url": "https://api.day.app", "bark_endpoint": ""},
+    "telegram": {"telegram_bot_token": "", "telegram_chat_id": ""},
     "pushplus": {"pushplus_token": ""},
     "email": {
         "email_user": "", "email_pass": "", "email_to": "",
@@ -436,9 +455,12 @@ NOTIF_SCHEMA = {
     "webhook": {"webhook_url": ""},
 }
 
-_NOTIF_SECRET_FIELDS = {"bark_key", "pushplus_token", "email_pass"}
+_NOTIF_SECRET_FIELDS = {"bark_key", "bark_endpoint", "telegram_bot_token", "telegram_chat_id", "pushplus_token", "email_pass"}
 _NOTIF_ENV_MAP = {
     "bark_key": "BARK_KEY",
+    "bark_endpoint": "BARK_ENDPOINT",
+    "telegram_bot_token": "TELEGRAM_BOT_TOKEN",
+    "telegram_chat_id": "TELEGRAM_CHAT_ID",
     "pushplus_token": "PUSHPLUS_TOKEN",
     "email_user": "EMAIL_USER", "email_pass": "EMAIL_PASS",
     "email_to": "EMAIL_TO",     "email_from": "EMAIL_FROM",
