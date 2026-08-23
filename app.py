@@ -28,6 +28,8 @@ import signal
 import subprocess
 import threading
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +42,7 @@ from flask import (
 DATA_DIR = Path(os.environ.get("WEREAD_DATA_DIR", "/data/.weread"))
 PORT = int(os.environ.get("PORT", "7860"))
 READING_INTERVAL_HOURS = float(os.environ.get("READING_INTERVAL_HOURS", "12"))
+SELF_PING_MINUTES = float(os.environ.get("SELF_PING_MINUTES", "5"))
 START_SCRIPT = Path(os.environ.get("START_SCRIPT", "/app/start_reading.sh"))
 COOKIE_TTL_DAYS = 30
 LOGIN_QR_FRESH_MINUTES = 5
@@ -71,7 +74,7 @@ app.config["SESSION_COOKIE_SECURE"] = True
 
 
 # ─── Auth ──────────────────────────────────────────────────────────────────────
-_NO_AUTH_PATHS = {"/healthz", "/login"}
+_NO_AUTH_PATHS = {"/healthz", "/login", "/tg-webhook"}
 
 
 @app.before_request
@@ -282,6 +285,9 @@ def _scheduler_loop() -> None:
 
 def _start_background_threads() -> None:
     threading.Thread(target=_scheduler_loop, name="reader-scheduler", daemon=True).start()
+    threading.Thread(target=_self_ping_loop, name="self-ping", daemon=True).start()
+    # Register Telegram webhook (non-blocking, best-effort)
+    threading.Thread(target=_tg_register_webhook, name="tg-webhook-reg", daemon=True).start()
 
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
@@ -545,6 +551,161 @@ def route_notif_save() -> Response:
     return jsonify({"ok": True})
 
 
+# ─── Telegram bot (webhook-based) ─────────────────────────────────────────────
+def _tg_api(method: str, **params) -> dict | None:
+    """Call Telegram Bot API method."""
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if not token:
+        return None
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    try:
+        data = urllib.parse.urlencode(params).encode()
+        req = urllib.request.Request(url, data=data)
+        resp = urllib.request.urlopen(req, timeout=15)
+        return json.loads(resp.read())
+    except Exception as e:
+        print(f"[tg-api] {method}: {e}", flush=True)
+        return None
+
+
+def _tg_send(chat_id: int, text: str) -> None:
+    _tg_api("sendMessage", chat_id=str(chat_id), text=text, parse_mode="HTML")
+
+
+def _tg_register_webhook() -> None:
+    """Register Telegram webhook pointing to this space's /tg-webhook."""
+    space_url = os.environ.get("SPACE_URL", "").rstrip("/")
+    if not space_url or not os.environ.get("TELEGRAM_BOT_TOKEN"):
+        return
+    webhook_url = f"{space_url}/tg-webhook"
+    result = _tg_api("setWebhook", url=webhook_url, allowed_updates='["message"]')
+    if result and result.get("ok"):
+        print(f"[tg-bot] webhook registered: {webhook_url}", flush=True)
+    else:
+        print(f"[tg-bot] webhook registration failed: {result}", flush=True)
+
+
+@app.route("/tg-webhook", methods=["POST"])
+def route_tg_webhook():
+    """Handle incoming Telegram bot messages."""
+    allowed_chat = os.environ.get("TELEGRAM_CHAT_ID", "")
+    data = request.get_json(silent=True) or {}
+    msg = data.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    text = (msg.get("text") or "").strip()
+
+    # Security: only respond to the configured chat
+    if not allowed_chat or str(chat_id) != str(allowed_chat):
+        return jsonify({"ok": True})
+
+    cmd = text.split()[0].split("@")[0].lower() if text else ""
+
+    if cmd == "/ping":
+        _tg_send(chat_id, "pong")
+
+    elif cmd == "/status":
+        rs = _reading_state()
+        lr = rs.get("last_run", {})
+        eta = rs.get("eta_seconds")
+        eta_str = f"{int(eta // 60)}m{int(eta % 60)}s" if eta else "—"
+        _tg_send(chat_id, (
+            f"<b>WeRead Challenge</b>\n"
+            f"Phase: <code>{rs.get('phase', '?')}</code>\n"
+            f"PID: <code>{rs.get('pid', '—')}</code>\n"
+            f"ETA: <code>{eta_str}</code>\n"
+            f"Cookies: <code>{rs.get('cookies', {}).get('status', '?')}</code>\n"
+            f"Last: <code>{lr.get('status', '—')}</code>"
+        ))
+
+    elif cmd == "/restart":
+        try:
+            pid = _pid_alive()
+            _kill_reader(pid)
+            try:
+                PID_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            for f in [COOKIES_JSON, LOGIN_PNG]:
+                try:
+                    f.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            for _ in range(20):
+                time.sleep(0.1)
+                if _pid_alive() != pid:
+                    break
+            new_pid = _spawn_reader("tg-restart")
+            _tg_send(chat_id, f"Restarted. Old PID: {pid}, New PID: {new_pid}")
+        except Exception as e:
+            _tg_send(chat_id, f"Restart failed: {e}")
+
+    elif cmd == "/start_reading":
+        if _pid_alive() is not None:
+            _tg_send(chat_id, "Already running.")
+        else:
+            pid = _spawn_reader("tg-manual")
+            _tg_send(chat_id, f"Started. PID: {pid}")
+
+    elif cmd == "/stop":
+        pid = _pid_alive()
+        if pid is None:
+            _tg_send(chat_id, "Not running.")
+        else:
+            _kill_reader(pid)
+            try:
+                PID_FILE.unlink(missing_ok=True)
+            except OSError:
+                pass
+            _tg_send(chat_id, f"Stopped. PID: {pid}")
+
+    elif cmd == "/logs":
+        if APP_LOG.exists():
+            with APP_LOG.open("r", encoding="utf-8", errors="replace") as f:
+                try:
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    f.seek(max(0, size - 4000))
+                except OSError:
+                    f.seek(0)
+                tail = f.read().splitlines()[-20:]
+            log_text = "\n".join(tail) or "(empty)"
+        else:
+            log_text = "(no log file)"
+        if len(log_text) > 3500:
+            log_text = log_text[-3500:]
+        _tg_send(chat_id, f"<pre>{log_text}</pre>")
+
+    elif cmd in ("/help", "/start"):
+        _tg_send(chat_id, (
+            "<b>WeRead Challenge Bot</b>\n\n"
+            "/ping — connectivity test\n"
+            "/status — reading status\n"
+            "/restart — kill &amp; restart reading\n"
+            "/start_reading — manual trigger\n"
+            "/stop — stop reading\n"
+            "/logs — last 20 log lines\n"
+            "/help — this message"
+        ))
+    else:
+        _tg_send(chat_id, f"Unknown: {text}\nType /help for commands.")
+
+    return jsonify({"ok": True})
+
+
+
+
+# ─── Self-ping (keep-alive) ───────────────────────────────────────────────────
+def _self_ping_loop() -> None:
+    """Periodically curl /healthz to keep the space awake."""
+    interval = max(60.0, SELF_PING_MINUTES * 60)
+    while True:
+        time.sleep(interval)
+        try:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{PORT}/healthz", timeout=10
+            )
+        except Exception:
+            pass
 
 
 @app.route("/healthz")
